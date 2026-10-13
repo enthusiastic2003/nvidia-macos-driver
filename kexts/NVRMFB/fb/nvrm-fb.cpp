@@ -212,6 +212,9 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     UInt64 fNvscanSequence = 0;
     UInt64 fNvscanCopyNs = 0, fNvscanCopyMaxNs = 0;
     UInt32 fNvscanCopies = 0, fNvscanGpuCopies = 0, fNvscanGpuFailures = 0;
+    UInt32 fNvscanSrcBlack = 0, fNvscanDstBlack = 0, fNvscanLost = 0;   // diagnostic: 16-pixel samples per frame
+    // diagnostic: black frames per source buffer, with the buffer's physical (BAR1) address
+    struct NvscanBuf { const void *memory; NvU64 phys; UInt32 frames, black; } fNvscanBufs[8] = {};
     // The GPU copies frames into the ivshmem slots through NVRM's copy-engine
     // page-off; the slots' guest-physical pages, one array per slot
     IOService *fNvscanRM = nullptr;
@@ -223,6 +226,22 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     void nvscanPublish(struct NvKmsKapiMemory *memory, const void *source, NvU32 width, NvU32 height, NvU32 pitch);
     bool nvscanGpuCopy(struct NvKmsKapiMemory *memory, UInt32 slot, UInt64 bytes);
     void nvscanCursorImage(const UInt32 *argb, unsigned width, unsigned height, unsigned hotX, unsigned hotY);
+    // A flip is copied once the display has latched it (NVKMS's FLIP_OCCURRED):
+    // a flip is submitted before the GPU finishes drawing the surface (the
+    // display waits for that, a copy-engine copy doesn't), and copying at
+    // submission caught surfaces still black. The newest flip waits here; a
+    // later one replaces it.
+    struct NvscanPending {
+        struct NvKmsKapiMemory *memory; const void *source;
+        NvU32 width, height, pitch; SInt32 latch; UInt64 gen; bool needLatch;
+    } fNvscanPending = {};
+    UInt64 fNvscanDoneGen = 0;
+    thread_call_t fNvscanCall = nullptr;
+    static inline NVRMNVDAFramebuffer *volatile sNvscanFB = nullptr;   // the framebuffer publishing frames
+    void nvscanLatched();
+    void nvscanQueue(struct NvKmsKapiMemory *memory, const void *source, NvU32 width, NvU32 height, NvU32 pitch,
+                     SInt32 latchBefore, bool needLatch = true);
+    static void nvscanFire(thread_call_param_t p0, thread_call_param_t);
     void nvscanCursorState();
     bool fConsoleAperture = false;
     NvU64 fBar1Base = 0;
@@ -311,7 +330,11 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
             FBLOG("kapi event type %d (display change)", (int)event->type);
         if (event->type == NVKMS_EVENT_TYPE_FLIP_OCCURRED && event->u.flipOccurred.head < 8
             && event->u.flipOccurred.layer == NVKMS_KAPI_LAYER_PRIMARY_IDX)
+        {
             OSIncrementAtomic(&sFlipLatched[event->u.flipOccurred.head]);
+            NVRMNVDAFramebuffer *scan = sNvscanFB;
+            if (scan && scan->fHead == event->u.flipOccurred.head) scan->nvscanLatched();
+        }
         // A display connected (or a connector changed) after boot: look for it off this context, after a short
         // settle (EDID reads follow the hot-plug interrupt).
         if (event->type == NVKMS_EVENT_TYPE_DPY_CHANGED || event->type == NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED)
@@ -1868,6 +1891,8 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     fReflip = thread_call_allocate(reflipFire, this);
     FBLOG("reflip keep-alive NOT armed: enableController's modeset owns the head, no boot-time re-syncs");
     fBars = thread_call_allocate(barsFire, this);
+    fNvscanCall = thread_call_allocate(nvscanFire, this);
+    if (fNvscanCall && fIndex == 0) sNvscanFB = this;
     uint32_t hudGate = 0;
     if (fBars && PE_parse_boot_argn("nvhud", &hudGate, sizeof hudGate) && hudGate) {
         uint64_t d; clock_interval_to_deadline(45, kSecondScale, &d);
@@ -1920,7 +1945,8 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
         if (sl) IORecursiveLockUnlock(sl);
         if (mine) release();
     }
-    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fLogoWatch};
+    if (sNvscanFB == this) sNvscanFB = nullptr;
+    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fLogoWatch, &fNvscanCall};
     for (unsigned i = 0; i < sizeof calls / sizeof calls[0]; ++i) {
         thread_call_t call = *calls[i];
         if (!call) continue;
@@ -2686,6 +2712,38 @@ bool NVRMNVDAFramebuffer::nvscanInit()
     return true;
 }
 
+void NVRMNVDAFramebuffer::nvscanQueue(struct NvKmsKapiMemory *memory, const void *source, NvU32 width,
+                                      NvU32 height, NvU32 pitch, SInt32 latchBefore, bool needLatch)
+{
+    if (fIndex != 0 || !fNvscanCall || (fNvscanTried && !fNvscanKva)) return;
+    IOInterruptState state = IOSimpleLockLockDisableInterrupt(fFlipCacheLock);
+    fNvscanPending.memory = memory; fNvscanPending.source = source;
+    fNvscanPending.width = width; fNvscanPending.height = height; fNvscanPending.pitch = pitch;
+    fNvscanPending.latch = latchBefore; fNvscanPending.needLatch = needLatch; fNvscanPending.gen++;
+    IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
+    // Its FLIP_OCCURRED may already have come and gone.
+    if (!needLatch || (SInt32)(sFlipLatched[fHead & 7] - latchBefore) > 0) scheduleCall(fNvscanCall, 0);
+}
+
+void NVRMNVDAFramebuffer::nvscanLatched()
+{
+    scheduleCall(fNvscanCall, 0);
+}
+
+void NVRMNVDAFramebuffer::nvscanFire(thread_call_param_t p0, thread_call_param_t)
+{
+    NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
+    NVRMCallReference callReference(me);
+    if (OSAddAtomic(0, &me->fStopping)) return;
+    IOInterruptState state = IOSimpleLockLockDisableInterrupt(me->fFlipCacheLock);
+    const NvscanPending p = me->fNvscanPending;
+    IOSimpleLockUnlockEnableInterrupt(me->fFlipCacheLock, state);
+    // Not latched yet (the GPU may still be drawing it): its FLIP_OCCURRED runs this again.
+    if (p.gen == me->fNvscanDoneGen || (p.needLatch && (SInt32)(sFlipLatched[me->fHead & 7] - p.latch) <= 0)) return;
+    me->fNvscanDoneGen = p.gen;
+    me->nvscanPublish(p.memory, p.source, p.width, p.height, p.pitch);
+}
+
 // The host draws the cursor itself (QEMU defines it as the window's pointer),
 // so the image and state go to the header rather than into the frames.
 void NVRMNVDAFramebuffer::nvscanCursorImage(const UInt32 *argb, unsigned width, unsigned height,
@@ -2750,20 +2808,55 @@ void NVRMNVDAFramebuffer::nvscanPublish(struct NvKmsKapiMemory *memory, const vo
     const UInt32 slot = (UInt32)((fNvscanSequence + 1) & 1u);
     void *destination = (void *)(uintptr_t)(fNvscanKva + nvscan_slot_offset(slot));
     uint64_t t0 = mach_absolute_time();
-    if (nvscanGpuCopy(memory, slot, (UInt64)pitch * height)) fNvscanGpuCopies++;
-    else nvu_copy(destination, source, (size_t)pitch * height);
+    const bool gpuCopy = nvscanGpuCopy(memory, slot, (UInt64)pitch * height);
+    if (gpuCopy) {
+        fNvscanGpuCopies++;
+    } else {
+        nvu_copy(destination, source, (size_t)pitch * height);
+    }
+    // NullMoth sometimes submits an all-zero framebuffer for whole runs of
+    // display transactions. Publishing those frames makes QEMU flash black;
+    // keep the last completed non-black frame instead. Sample the completed
+    // destination, not only sourceKva: for a VRAM surface, the CPU mapping can
+    // be stale while the copy-engine result is current.
+    bool srcLit = false, dstLit = false;
+    for (unsigned i = 0; i < 16; i++) {
+        const size_t off = (size_t)((height - 1) * (i + 1) / 17) * pitch +
+                           (size_t)((width - 1) * (i + 1) / 17) * 4;
+        const UInt32 a = *(const volatile UInt32 *)((const UInt8 *)source + off) & 0xffffffu;
+        const UInt32 b = *(const volatile UInt32 *)((const UInt8 *)destination + off) & 0xffffffu;
+        srcLit |= a != 0; dstLit |= b != 0;
+    }
+    if (!srcLit) fNvscanSrcBlack++;
+    for (unsigned b = 0; b < 8; b++) {
+        NvscanBuf &e = fNvscanBufs[b];
+        if (e.memory && e.memory != memory) continue;
+        if (!e.memory) { e.memory = memory; e.phys = fPhysForVa ? fPhysForVa(source) : 0; }
+        e.frames++; if (!srcLit) e.black++;
+        break;
+    }
+    if (!dstLit) fNvscanDstBlack++;
+    if (srcLit && !dstLit) fNvscanLost++;
     uint64_t ns = 0;
     absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
     fNvscanCopyNs += ns;
     if (ns > fNvscanCopyMaxNs) fNvscanCopyMaxNs = ns;
     if (++fNvscanCopies == 120) {
-        FBLOG("nvscan: copy of %ux%u (%u KB) avg %llu us max %llu us = %llu MB/s (%u of 120 by the GPU)",
+        FBLOG("nvscan: copy of %ux%u (%u KB) avg %llu us max %llu us = %llu MB/s (%u of 120 by the GPU); "
+              "black: surface %u, copy %u, copy black but surface not %u",
               width, height, (unsigned)((size_t)pitch * height >> 10),
               fNvscanCopyNs / 120000, fNvscanCopyMaxNs / 1000,
               fNvscanCopyNs ? (unsigned long long)((uint64_t)pitch * height * 120 * 1000 / fNvscanCopyNs) : 0ULL,
-              fNvscanGpuCopies);
+              fNvscanGpuCopies, fNvscanSrcBlack, fNvscanDstBlack, fNvscanLost);
         fNvscanCopies = 0; fNvscanCopyNs = 0; fNvscanCopyMaxNs = 0; fNvscanGpuCopies = 0;
+        fNvscanSrcBlack = fNvscanDstBlack = fNvscanLost = 0;
+        for (unsigned b = 0; b < 8 && fNvscanBufs[b].memory; b++)
+            FBLOG("nvscan:   buffer %u: memory %p phys 0x%llx %s: %u frames, %u black", b, fNvscanBufs[b].memory,
+                  (unsigned long long)fNvscanBufs[b].phys, fNvscanBufs[b].memory == (const void *)fMem ? "(home fb)" : "",
+                  fNvscanBufs[b].frames, fNvscanBufs[b].black);
+        nvu_zero(fNvscanBufs, sizeof fNvscanBufs);
     }
+    if (!dstLit) return;
     header->width = width;
     header->height = height;
     header->stride = pitch;
@@ -2797,6 +2890,27 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
         }
         return kIOReturnSuccess;
     }
+    if (functionName && functionName->isEqualTo(NVRM_VRAM_FN_WRITTEN)) {
+        if (!fMem || !fKva || !fW || !fH || !fPitch) return kIOReturnNotReady;
+        // Called synchronously by NVAccel after its final row store. Copy now,
+        // before another display transaction can begin overwriting the home
+        // framebuffer.
+        nvscanPublish(fMem, fKva, fW, fH, fPitch);
+        return kIOReturnSuccess;
+    }
+    if (functionName && functionName->isEqualTo(NVRM_VRAM_FN_PUBLISH)) {
+        struct NVRMFlipRequest *f = (struct NVRMFlipRequest *)param1;
+        if (!f || f->version != NVRM_FLIP_ABI_VERSION || !f->sourceKva ||
+            !f->width || !f->height || f->pitch < f->width * 4u)
+            return kIOReturnBadArgument;
+        // NVSCAN is a host-only sink. Publish the completed compositor
+        // allocation straight from VRAM instead of first paging it into an
+        // IOSurface and copying it through the home framebuffer.
+        if (fIndex != 0 || !nvscanInit()) return kIOReturnUnsupported;
+        nvscanPublish((struct NvKmsKapiMemory *)f->kapiMemory, f->sourceKva,
+                      f->width, f->height, f->pitch);
+        return kIOReturnSuccess;
+    }
     if (functionName && functionName->isEqualTo(NVRM_GPUVA_FN_HANDLES)) {
         struct NVRMRmHandles *h = (struct NVRMRmHandles *)param1;
         if (!h || h->version != NVRM_GPUVA_ABI_VERSION) return kIOReturnBadArgument;
@@ -2813,21 +2927,24 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
         const bool home = (f->flags & 1u) != 0;
         const bool pureHome = home && fModeSet;
         if (pureHome) { fHomePure++; if (fHomePure <= 4) FBLOG("home flip #%u: pure (head %u already lit, no modeset)", fHomePure, fHead); }
+        const SInt32 latchBefore = sFlipLatched[fHead & 7];
         bool ok = flipToMemory(home ? nullptr : (struct NvKmsKapiMemory *)f->kapiMemory,
                                f->width, f->height, f->pitch, &rc, !home || pureHome, f->allocationCookie);
         f->flipResult = rc;
-        if (ok) nvscanPublish(home ? fMem : (struct NvKmsKapiMemory *)f->kapiMemory,
-                              home ? fKva : f->sourceKva, f->width, f->height, f->pitch);
+        if (ok) nvscanQueue(home ? fMem : (struct NvKmsKapiMemory *)f->kapiMemory,
+                            home ? fKva : f->sourceKva, f->width, f->height, f->pitch, latchBefore);
         return ok ? kIOReturnSuccess : kIOReturnIOError;
     }
     if (functionName && functionName->isEqualTo(NVRM_FLIP_FN)) {
         struct NVRMFlipRequest *f = (struct NVRMFlipRequest *)param1;
         if (!f || f->version != NVRM_FLIP_ABI_VERSION) return kIOReturnBadArgument;
         int rc = -1;
+        const SInt32 latchBefore = sFlipLatched[fHead & 7];
         bool ok = flipToMemory((struct NvKmsKapiMemory *)f->kapiMemory,
                                f->width, f->height, f->pitch, &rc, false, f->allocationCookie);
         f->flipResult = rc;
-        if (ok) nvscanPublish((struct NvKmsKapiMemory *)f->kapiMemory, f->sourceKva, f->width, f->height, f->pitch);
+        if (ok) nvscanQueue((struct NvKmsKapiMemory *)f->kapiMemory, f->sourceKva, f->width, f->height, f->pitch,
+                            latchBefore);
         return ok ? kIOReturnSuccess : kIOReturnIOError;
     }
     const char *name = functionName ? functionName->getCStringNoCopy() : "(null)";

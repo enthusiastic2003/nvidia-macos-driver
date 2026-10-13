@@ -11,6 +11,8 @@
 #define NVRM_VRAM_FN_FREE     "nvFreeVram"
 
 #define NVRM_VRAM_FN_SCANOUT  "nvScanoutInfo"
+#define NVRM_VRAM_FN_WRITTEN  "nvScanoutWritten"
+#define NVRM_VRAM_FN_PUBLISH  "nvScanoutPublish"
 
 #define NVRM_VRAM_BAR1_BUDGET (192ull * 1024ull * 1024ull)
 

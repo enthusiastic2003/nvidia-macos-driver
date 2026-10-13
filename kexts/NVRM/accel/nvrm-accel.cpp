@@ -931,6 +931,32 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
         return kIOReturnSuccess;
     } else if (s) {
+        // NVSCAN can consume the completed compositor allocation directly.
+        // This avoids relying on IOSurface's system-memory valid bits, whose
+        // missed dirty notifications can otherwise leave us copying a black
+        // or wallpaper-only stale image even though the VRAM image is current.
+        volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30) : nullptr;
+        const bool vramNewest = valid && (valid[6] & 1u);
+        if (vramNewest && vm && vm->fRmHandle && vm->fKva) {
+            const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
+            if (W && H && P >= 4 * W && H * P <= vm->fBytes) {
+                struct NVRMFlipRequest f;
+                for (unsigned i = 0; i < sizeof f; i++) ((volatile unsigned char *)&f)[i] = 0;
+                f.version = NVRM_FLIP_ABI_VERSION;
+                f.kapiMemory = vm->fRmHandle; f.sourceKva = vm->fKva;
+                f.allocationCookie = vm->fAllocationCookie;
+                f.width = (unsigned)W; f.height = (unsigned)H; f.pitch = (unsigned)P;
+                const OSSymbol *publish = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_PUBLISH);
+                IOReturn pr = publish ? fb->callPlatformFunction(publish, false, &f, nullptr, nullptr, nullptr)
+                                     : kIOReturnNoMemory;
+                if (publish) publish->release();
+                if (pr == kIOReturnSuccess) {
+                    OSAddAtomic64(1, &gCntIopSrcRes); OSAddAtomic64(1, &gCntIopOk);
+                    OSAddAtomic64(1, &gCntIopOkHead[head]);
+                    return kIOReturnSuccess;
+                }
+            }
+        }
         // A copied frame must come from the surface's newest pixels. Copying while they were still only in VRAM put a
         // stale, one-colour buffer on the panel every other frame: full-screen flicker, 5 of 40 flicker recordings
         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
@@ -951,6 +977,25 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     }
     if (!w || !h || pitch < 4) NVIOP_FAIL(kIOReturnBadArgument, "source geometry %ux%u pitch %u", w, h, pitch);
 
+    // If IOSurface memory is authoritative, publish it directly as well. This
+    // is the other half of the hybrid path: WindowServer alternates surfaces
+    // whose newest copy is not necessarily in the same memory domain.
+    if (!fromRes) {
+        struct NVRMFlipRequest f;
+        for (unsigned i = 0; i < sizeof f; i++) ((volatile unsigned char *)&f)[i] = 0;
+        f.version = NVRM_FLIP_ABI_VERSION; f.sourceKva = (const void *)src;
+        f.width = w; f.height = h; f.pitch = pitch;
+        const OSSymbol *publish = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_PUBLISH);
+        IOReturn pr = publish ? fb->callPlatformFunction(publish, false, &f, nullptr, nullptr, nullptr)
+                             : kIOReturnNoMemory;
+        if (publish) publish->release();
+        if (pr == kIOReturnSuccess) {
+            OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk);
+            OSAddAtomic64(1, &gCntIopOkHead[head]);
+            return kIOReturnSuccess;
+        }
+    }
+
     struct NVRMVramRequest q;
     for (unsigned i = 0; i < sizeof q; i++) ((volatile unsigned char *)&q)[i] = 0;
     q.version = NVRM_VRAM_ABI_VERSION;
@@ -966,6 +1011,14 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         const volatile unsigned int *sp = src + (unsigned long)y * spr;
         volatile unsigned int *dp = d + (unsigned long)y * dpr;
         for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
+    }
+    // The framebuffer is now complete. NVSCAN used to sample it at vblank,
+    // which could land halfway through this slow BAR1 row copy and publish a
+    // partially black frame. Notify NVRMFB at the exact completion point.
+    const OSSymbol *written = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_WRITTEN);
+    if (written) {
+        fb->callPlatformFunction(written, false, nullptr, nullptr, nullptr, nullptr);
+        written->release();
     }
     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
