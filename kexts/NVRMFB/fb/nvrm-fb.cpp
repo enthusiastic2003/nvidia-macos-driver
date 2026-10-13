@@ -222,6 +222,8 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     bool nvscanInit();
     void nvscanPublish(struct NvKmsKapiMemory *memory, const void *source, NvU32 width, NvU32 height, NvU32 pitch);
     bool nvscanGpuCopy(struct NvKmsKapiMemory *memory, UInt32 slot, UInt64 bytes);
+    void nvscanCursorImage(const UInt32 *argb, unsigned width, unsigned height, unsigned hotX, unsigned hotY);
+    void nvscanCursorState();
     bool fConsoleAperture = false;
     NvU64 fBar1Base = 0;
     NvU8 fEdid[NVKMS_KAPI_EDID_BUFFER_SIZE]; NvU16 fEdidSize = 0;
@@ -403,6 +405,45 @@ struct nvrm_dpy_rec {
 static struct NvKmsKapiDevice *gDev;
 static struct nvrm_dpy_rec gDpy[NVKMS_KAPI_MAX_CONNECTORS * 2];
 static int gNDpy = -1;
+
+// nvscan (a VM whose host shows the frames): with nothing on any connector the
+// GPU drives no head and publishes no frames, so the first connector is forced
+// connected with this EDID - one mode, 1920x1080 at 60 Hz (CEA-861 timing,
+// 148.5 MHz), "NVS" "NVSCAN" - the software equivalent of an HDMI dummy plug.
+// A real display on that connector is still used as it is.
+static const NvU8 kNvscanEdid[128] = {
+    0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x3a, 0xd3, 0x43, 0x53, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x24, 0x01, 0x03, 0x80, 0x34, 0x1d, 0x78, 0x0a, 0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26,
+    0x0f, 0x50, 0x54, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3a, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c,
+    0x45, 0x00, 0x08, 0x22, 0x21, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x4e, 0x56, 0x53,
+    0x43, 0x41, 0x4e, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xfd, 0x00, 0x32,
+    0x4b, 0x1e, 0x50, 0x11, 0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x10,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24,
+};
+static NvKmsKapiDisplay gForcedDpy = 0;   // the connector forced connected, 0 = none
+
+static bool nvscanEnabled()
+{
+    int enabled = 0;
+    return PE_parse_boot_argn("nvscan", &enabled, sizeof enabled) && enabled;
+}
+
+// getDynamicDisplayInfo; with `force`, a connector found empty is queried again
+// as connected with kNvscanEdid (NVKMS's forceConnected / overrideEdid).
+static bool nvrmDynamicInfo(struct NvKmsKapiFunctionsTable *kms, struct NvKmsKapiDevice *dev,
+                            struct NvKmsKapiDynamicDisplayParams *dd, NvKmsKapiDisplay handle, bool force)
+{
+    nvu_zero(dd, sizeof *dd); dd->handle = handle;
+    if (!kms->getDynamicDisplayInfo(dev, dd)) return false;
+    if (dd->connected || !force) return true;
+    nvu_zero(dd, sizeof *dd); dd->handle = handle;
+    dd->forceConnected = NV_TRUE;
+    dd->overrideEdid = NV_TRUE;
+    dd->edid.bufferSize = sizeof kNvscanEdid;
+    nvu_copy(dd->edid.buffer, kNvscanEdid, sizeof kNvscanEdid);
+    return kms->getDynamicDisplayInfo(dev, dd);
+}
 static int gBootHead = -2;
 static NvKmsKapiDisplay gBootDpy = 0;
 static struct NvKmsKapiDisplayMode gBootMode;
@@ -665,6 +706,24 @@ bool NVRMNVDAFramebuffer::kapiInit()
             r->handle = handles[i]; r->connector = si.connectorHandle; r->headMask = si.headMask; r->internal = si.internal;
             r->edidSize = dd->edid.bufferSize > sizeof r->edid ? (NvU32)sizeof r->edid : dd->edid.bufferSize;
             nvu_copy(r->edid, dd->edid.buffer, r->edidSize);
+        }
+        if (gNDpy == 0 && nvscanEnabled()) {
+            for (NvU32 i = 0; i < n && gNDpy == 0; i++) {
+                struct NvKmsKapiStaticDisplayInfo si = {};
+                if (!nvrmDynamicInfo(fKms, fDev, dd, handles[i], true) || !dd->connected ||
+                    !fKms->getStaticDisplayInfo(fDev, handles[i], &si)) {
+                    FBLOG("dpy %u/%u 0x%x: forcing it connected FAILED", i, n, handles[i]);
+                    continue;
+                }
+                struct nvrm_dpy_rec *r = &gDpy[gNDpy++];
+                r->handle = handles[i]; r->connector = si.connectorHandle; r->headMask = si.headMask; r->internal = si.internal;
+                r->edidSize = dd->edid.bufferSize > sizeof r->edid ? (NvU32)sizeof r->edid : dd->edid.bufferSize;
+                nvu_copy(r->edid, dd->edid.buffer, r->edidSize);
+                gForcedDpy = handles[i];
+                FBLOG("dpy %u/%u 0x%x: nothing connected - FORCED connected with the built-in 1920x1080 EDID "
+                      "(nvscan; edid %u B, connector 0x%x headMask 0x%x)", i, n, handles[i],
+                      dd->edid.bufferSize, (unsigned)si.connectorHandle, (unsigned)si.headMask);
+            }
         }
         IOFree(dd, sizeof *dd);
         if (getProvider()) getProvider()->setProperty("connected-displays", (unsigned long long)gNDpy, 32);
@@ -1141,8 +1200,8 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     for (NvU32 i = 0; i < n; i++) {
         bool known = false;
         for (int k = 0; k < gNDpy; k++) if (gDpy[k].handle == handles[i]) { known = true; break; }
-        nvu_zero(dd, sizeof *dd); dd->handle = handles[i];
-        bool dynOk = me->fKms->getDynamicDisplayInfo(me->fDev, dd);
+        // the forced connector stays connected (re-forced if its sink is still absent)
+        bool dynOk = nvrmDynamicInfo(me->fKms, me->fDev, dd, handles[i], handles[i] == gForcedDpy);
         if (known) {
             // 1401/driver issue #110: switching the monitor to another input and back left it with no picture. The link
             // drops, the head stops scanning out, and this path skipped every display it already knew. A known display
@@ -1520,6 +1579,7 @@ IOReturn NVRMNVDAFramebuffer::setCursorImage(void *cursorImage)
     bool converted = convertCursorImage(cursorImage, &d, &ci);
     bool packed = converted && nvrmPackCursor((UInt32 *)fCurKva, fCurDim, staging,
                                                ci.cursorWidth, ci.cursorHeight);
+    if (packed) nvscanCursorImage(staging, ci.cursorWidth, ci.cursorHeight, ci.cursorHotSpotX, ci.cursorHotSpotY);
     IOFree(staging, bytes);
     if (!packed) {
         bool hadImage = fCurHaveImage;
@@ -1544,6 +1604,7 @@ IOReturn NVRMNVDAFramebuffer::setCursorState(SInt32 x, SInt32 y, bool visible)
     if (x == fCurX && y == fCurY && visible == fCurVisible && fCurRc == NV_KMS_FLIP_RESULT_SUCCESS)
         return kIOReturnSuccess;
     fCurX = x; fCurY = y; fCurVisible = visible;
+    nvscanCursorState();
     return cursorApply() ? kIOReturnSuccess : kIOReturnError;
 }
 void NVRMNVDAFramebuffer::barsFire(thread_call_param_t p0, thread_call_param_t)
@@ -2623,6 +2684,35 @@ bool NVRMNVDAFramebuffer::nvscanInit()
     FBLOG("nvscan: mapped %u MiB ivshmem BAR2 at %p", NVSCAN_SHMEM_BYTES >> 20,
           (void *)(uintptr_t)fNvscanKva);
     return true;
+}
+
+// The host draws the cursor itself (QEMU defines it as the window's pointer),
+// so the image and state go to the header rather than into the frames.
+void NVRMNVDAFramebuffer::nvscanCursorImage(const UInt32 *argb, unsigned width, unsigned height,
+                                            unsigned hotX, unsigned hotY)
+{
+    if (!argb || !width || !height || width > NVSCAN_CURSOR_MAX || height > NVSCAN_CURSOR_MAX ||
+        !nvscanInit()) return;
+    struct nvscan_header *header = (struct nvscan_header *)(uintptr_t)fNvscanKva;
+    nvu_copy((void *)(uintptr_t)(fNvscanKva + NVSCAN_CURSOR_OFFSET), argb, (size_t)width * height * 4);
+    header->cursor_width = width;
+    header->cursor_height = height;
+    header->cursor_hot_x = hotX;
+    header->cursor_hot_y = hotY;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    header->cursor_image_sequence = header->cursor_image_sequence + 1;
+    nvscanCursorState();
+}
+
+void NVRMNVDAFramebuffer::nvscanCursorState()
+{
+    if (!fNvscanKva) return;
+    struct nvscan_header *header = (struct nvscan_header *)(uintptr_t)fNvscanKva;
+    header->cursor_x = fCurX;
+    header->cursor_y = fCurY;
+    header->cursor_visible = (fCurVisible && fCurHaveImage) ? 1u : 0u;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    header->cursor_state_sequence = header->cursor_state_sequence + 1;
 }
 
 bool NVRMNVDAFramebuffer::nvscanGpuCopy(struct NvKmsKapiMemory *memory, UInt32 slot, UInt64 bytes)

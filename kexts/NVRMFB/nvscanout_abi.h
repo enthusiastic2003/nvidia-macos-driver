@@ -31,7 +31,21 @@ struct nvscan_header {
     uint64_t frame_sequence;
     uint64_t frame_time_ns;
     uint64_t dropped_frames;
-    uint8_t reserved[NVSCAN_HEADER_BYTES - 72];
+    /* The hardware cursor (a separate display plane, so not in the frames):
+     * its image (straight ARGB, cursor_width x cursor_height, pitch
+     * cursor_width * 4) at NVSCAN_CURSOR_OFFSET, and its state. Each
+     * sequence is bumped after the data it covers is written; 0 = none. */
+    uint32_t cursor_width;
+    uint32_t cursor_height;
+    uint32_t cursor_hot_x;
+    uint32_t cursor_hot_y;
+    int32_t  cursor_x;          /* the image's top-left on screen */
+    int32_t  cursor_y;
+    uint32_t cursor_visible;
+    uint32_t cursor_pad;
+    uint64_t cursor_image_sequence;
+    uint64_t cursor_state_sequence;
+    uint8_t reserved[NVSCAN_HEADER_BYTES - 120];
 };
 
 #if defined(__cplusplus)
@@ -41,6 +55,9 @@ static_assert(sizeof(struct nvscan_header) == NVSCAN_HEADER_BYTES,
 _Static_assert(sizeof(struct nvscan_header) == NVSCAN_HEADER_BYTES,
                "nvscan header must occupy one page");
 #endif
+
+#define NVSCAN_CURSOR_MAX 256u
+#define NVSCAN_CURSOR_OFFSET (NVSCAN_HEADER_BYTES + 2ull * NVSCAN_SLOT_BYTES)
 
 static inline uint64_t nvscan_slot_offset(uint32_t slot)
 {
