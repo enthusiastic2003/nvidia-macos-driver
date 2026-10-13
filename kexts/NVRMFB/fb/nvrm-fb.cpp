@@ -16,6 +16,7 @@
 #include <mach/mach_time.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOPlatformExpert.h>
+#include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>
@@ -27,6 +28,9 @@
 #include "nvrm-hud.h"
 #include "nvrm-fb-safety.h"
 #include "nvrm-allocation-table.h"
+#include "../nvscanout_abi.h"
+#define NVRM_SS_KERNEL_ABI 1
+#include "../nvrm_surfshare_abi.h"
 static IORecursiveLock *startLock();
 class NVRMCallReference {
     OSObject *owner;
@@ -203,6 +207,21 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     IOMemoryDescriptor *fBarMem = nullptr; IOMemoryMap *fBarMap = nullptr;
     void *fBarKva = nullptr; NvU64 fBarLen = 0;
     void surveyBar1();
+    IOMemoryMap *fNvscanMap = nullptr;
+    volatile UInt8 *fNvscanKva = nullptr;
+    UInt64 fNvscanSequence = 0;
+    UInt64 fNvscanCopyNs = 0, fNvscanCopyMaxNs = 0;
+    UInt32 fNvscanCopies = 0, fNvscanGpuCopies = 0, fNvscanGpuFailures = 0;
+    // The GPU copies frames into the ivshmem slots through NVRM's copy-engine
+    // page-off; the slots' guest-physical pages, one array per slot
+    IOService *fNvscanRM = nullptr;
+    const OSSymbol *fNvscanPageoffFn = nullptr;
+    unsigned long long *fNvscanPages[2] = { nullptr, nullptr };
+    bool fNvscanGpu = false;
+    bool fNvscanTried = false;
+    bool nvscanInit();
+    void nvscanPublish(struct NvKmsKapiMemory *memory, const void *source, NvU32 width, NvU32 height, NvU32 pitch);
+    bool nvscanGpuCopy(struct NvKmsKapiMemory *memory, UInt32 slot, UInt64 bytes);
     bool fConsoleAperture = false;
     NvU64 fBar1Base = 0;
     NvU8 fEdid[NVKMS_KAPI_EDID_BUFFER_SIZE]; NvU16 fEdidSize = 0;
@@ -1887,6 +1906,10 @@ IOReturn NVRMNVDAFramebuffer::getAppleSense(IOIndex connectIndex, UInt32 *senseT
 
 void NVRMNVDAFramebuffer::free()
 {
+    if (fNvscanMap) { fNvscanMap->release(); fNvscanMap = nullptr; fNvscanKva = nullptr; }
+    for (unsigned i = 0; i < 2; i++)
+        if (fNvscanPages[i]) { IODelete(fNvscanPages[i], unsigned long long, NVSCAN_SLOT_BYTES / 4096); fNvscanPages[i] = nullptr; }
+    OSSafeReleaseNULL(fNvscanPageoffFn);
     if (fFlipCacheLock) { IOSimpleLockFree(fFlipCacheLock); fFlipCacheLock = nullptr; }
     if (fLogoKeep) { IODelete(fLogoKeep, uint32_t, (size_t)fLogoW * fLogoH); fLogoKeep = nullptr; }
     super::free();
@@ -2528,6 +2551,139 @@ bool NVRMNVDAFramebuffer::vramRelease(struct NVRMVramRequest *r)
     return true;
 }
 
+bool NVRMNVDAFramebuffer::nvscanInit()
+{
+    if (fNvscanKva) return true;
+    if (fNvscanTried || fIndex != 0) return false;
+    fNvscanTried = true;
+    int enabled = 0;
+    if (!PE_parse_boot_argn("nvscan", &enabled, sizeof enabled) || !enabled) return false;
+
+    OSDictionary *match = IOService::serviceMatching("IOPCIDevice");
+    OSIterator *iterator = match ? IOService::getMatchingServices(match) : nullptr;
+    OSSafeReleaseNULL(match);
+    if (!iterator) { FBLOG("nvscan: no PCI iterator"); return false; }
+
+    IOPCIDevice *device = nullptr;
+    while (OSObject *object = iterator->getNextObject()) {
+        IOPCIDevice *candidate = OSDynamicCast(IOPCIDevice, object);
+        if (candidate && candidate->configRead16(kIOPCIConfigVendorID) == 0x1af4 &&
+            candidate->configRead16(kIOPCIConfigDeviceID) == 0x1110) {
+            device = candidate;
+            break;
+        }
+    }
+    if (device) device->retain();
+    iterator->release();
+    if (!device) { FBLOG("nvscan: ivshmem PCI device 1af4:1110 not found"); return false; }
+
+    IODeviceMemory *memory = device->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
+    if (!memory || memory->getLength() < NVSCAN_SHMEM_BYTES) {
+        FBLOG("nvscan: BAR2 missing or smaller than %u MiB", NVSCAN_SHMEM_BYTES >> 20);
+        device->release();
+        return false;
+    }
+    // No macOS driver claims ivshmem, so nothing has enabled its memory
+    // decoding: without this the BAR is assigned but writes go nowhere
+    device->setMemoryEnable(true);
+    const UInt64 barPhys = memory->getPhysicalAddress();
+    fNvscanMap = memory->map(kIOMapAnywhere);
+    device->release();
+    if (!fNvscanMap) { FBLOG("nvscan: BAR2 map failed"); return false; }
+
+    // GPU copies: the copy engine writes each frame straight into a slot by
+    // guest-physical address (KVM maps passed-through VRAM uncached, so a CPU
+    // copy reads ~70 MB/s: 115 ms a 1080p frame)
+    IOService *rm = getProvider();
+    while (rm && strcmp(rm->getMetaClass()->getClassName(), "NVRM") != 0) rm = rm->getProvider();
+    const unsigned pages = NVSCAN_SLOT_BYTES / 4096;
+    fNvscanPageoffFn = OSSymbol::withCString(NVRM_SS_FN_PAGEOFF);
+    for (unsigned i = 0; i < 2; i++) {
+        fNvscanPages[i] = IONew(unsigned long long, pages);
+        if (!fNvscanPages[i]) break;
+        for (unsigned p = 0; p < pages; p++)
+            fNvscanPages[i][p] = barPhys + nvscan_slot_offset(i) + (UInt64)p * 4096;
+    }
+    fNvscanRM = rm;
+    fNvscanGpu = rm && fNvscanPageoffFn && fNvscanPages[0] && fNvscanPages[1];
+    FBLOG("nvscan: BAR2 at guest-physical 0x%llx; GPU copies %s", (unsigned long long)barPhys,
+          fNvscanGpu ? "on" : "unavailable (no NVRM service): CPU copies");
+    fNvscanKva = (volatile UInt8 *)(uintptr_t)fNvscanMap->getVirtualAddress();
+
+    struct nvscan_header *header = (struct nvscan_header *)(uintptr_t)fNvscanKva;
+    nvu_zero(header, sizeof *header);
+    header->version = NVSCAN_VERSION;
+    header->header_bytes = NVSCAN_HEADER_BYTES;
+    header->pixel_format = NVSCAN_X8R8G8B8;
+    header->slot_bytes = NVSCAN_SLOT_BYTES;
+    header->slot_count = 2;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    header->magic = NVSCAN_MAGIC;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    FBLOG("nvscan: mapped %u MiB ivshmem BAR2 at %p", NVSCAN_SHMEM_BYTES >> 20,
+          (void *)(uintptr_t)fNvscanKva);
+    return true;
+}
+
+bool NVRMNVDAFramebuffer::nvscanGpuCopy(struct NvKmsKapiMemory *memory, UInt32 slot, UInt64 bytes)
+{
+    if (!fNvscanGpu || !memory || !fDev) return false;
+    struct NVRMSurfPageoff p;
+    nvu_zero(&p, sizeof p);
+    p.version = NVRM_SS_RM_VERSION;
+    p.kapiDevice = fDev;
+    p.kapiMemory = memory;
+    p.pages = fNvscanPages[slot];
+    p.pageCount = (bytes + 4095) / 4096;
+    p.length = bytes;
+    IOReturn r = fNvscanRM->callPlatformFunction(fNvscanPageoffFn, false, &p, NULL, NULL, NULL);
+    if (r == kIOReturnSuccess && p.status == 0) {
+        fNvscanGpuFailures = 0;
+        return true;
+    }
+    if (++fNvscanGpuFailures <= 4)
+        FBLOG("nvscan: GPU copy failed (IOReturn 0x%x, status 0x%x): CPU copy instead", r, p.status);
+    if (fNvscanGpuFailures == 16) {
+        fNvscanGpu = false;
+        FBLOG("nvscan: GPU copies off after 16 failures in a row");
+    }
+    return false;
+}
+
+void NVRMNVDAFramebuffer::nvscanPublish(struct NvKmsKapiMemory *memory, const void *source, NvU32 width,
+                                        NvU32 height, NvU32 pitch)
+{
+    if (!source || !width || !height || pitch < width * 4u ||
+        (UInt64)pitch * height > NVSCAN_SLOT_BYTES || !nvscanInit()) return;
+
+    struct nvscan_header *header = (struct nvscan_header *)(uintptr_t)fNvscanKva;
+    const UInt32 slot = (UInt32)((fNvscanSequence + 1) & 1u);
+    void *destination = (void *)(uintptr_t)(fNvscanKva + nvscan_slot_offset(slot));
+    uint64_t t0 = mach_absolute_time();
+    if (nvscanGpuCopy(memory, slot, (UInt64)pitch * height)) fNvscanGpuCopies++;
+    else nvu_copy(destination, source, (size_t)pitch * height);
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+    fNvscanCopyNs += ns;
+    if (ns > fNvscanCopyMaxNs) fNvscanCopyMaxNs = ns;
+    if (++fNvscanCopies == 120) {
+        FBLOG("nvscan: copy of %ux%u (%u KB) avg %llu us max %llu us = %llu MB/s (%u of 120 by the GPU)",
+              width, height, (unsigned)((size_t)pitch * height >> 10),
+              fNvscanCopyNs / 120000, fNvscanCopyMaxNs / 1000,
+              fNvscanCopyNs ? (unsigned long long)((uint64_t)pitch * height * 120 * 1000 / fNvscanCopyNs) : 0ULL,
+              fNvscanGpuCopies);
+        fNvscanCopies = 0; fNvscanCopyNs = 0; fNvscanCopyMaxNs = 0; fNvscanGpuCopies = 0;
+    }
+    header->width = width;
+    header->height = height;
+    header->stride = pitch;
+    header->pixel_format = NVSCAN_X8R8G8B8;
+    header->write_slot = slot;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    header->frame_sequence = ++fNvscanSequence;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
 IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction,
                                                void *param1, void *param2, void *param3, void *param4)
 {
@@ -2570,6 +2726,8 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
         bool ok = flipToMemory(home ? nullptr : (struct NvKmsKapiMemory *)f->kapiMemory,
                                f->width, f->height, f->pitch, &rc, !home || pureHome, f->allocationCookie);
         f->flipResult = rc;
+        if (ok) nvscanPublish(home ? fMem : (struct NvKmsKapiMemory *)f->kapiMemory,
+                              home ? fKva : f->sourceKva, f->width, f->height, f->pitch);
         return ok ? kIOReturnSuccess : kIOReturnIOError;
     }
     if (functionName && functionName->isEqualTo(NVRM_FLIP_FN)) {
@@ -2579,6 +2737,7 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
         bool ok = flipToMemory((struct NvKmsKapiMemory *)f->kapiMemory,
                                f->width, f->height, f->pitch, &rc, false, f->allocationCookie);
         f->flipResult = rc;
+        if (ok) nvscanPublish((struct NvKmsKapiMemory *)f->kapiMemory, f->sourceKva, f->width, f->height, f->pitch);
         return ok ? kIOReturnSuccess : kIOReturnIOError;
     }
     const char *name = functionName ? functionName->getCStringNoCopy() : "(null)";

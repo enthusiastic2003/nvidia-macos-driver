@@ -14,7 +14,7 @@
 #define NVRM_GPUVA_FN_MAP     "nvGpuVaMap"
 #define NVRM_GPUVA_FN_FREE    "nvGpuVaFree"
 
-#define NVRM_FLIP_ABI_VERSION 2u
+#define NVRM_FLIP_ABI_VERSION 3u
 
 #define NVRM_FLIP_FN  "nvFlipToSurface"
 
@@ -26,6 +26,7 @@ struct NVRMFlipRequest {
     unsigned int pitch;
     int          flipResult;
     unsigned long long allocationCookie;
+    const void  *sourceKva;
 };
 #define NVRM_GPUVA_FN_HANDLES "nvRmHandles"
 

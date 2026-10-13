@@ -1568,7 +1568,8 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
     if (!W || !H || P < 4 * W || H * P > bytes) return nvAccelIopFlipNo(6);
     struct NVRMFlipRequest f; nvSVZero(&f, sizeof f);
-    f.version = NVRM_FLIP_ABI_VERSION; f.kapiMemory = kmem; f.allocationCookie = vm->fAllocationCookie; f.width = (unsigned)W; f.height = (unsigned)H; f.pitch = (unsigned)P;
+    f.version = NVRM_FLIP_ABI_VERSION; f.kapiMemory = kmem; f.allocationCookie = vm->fAllocationCookie;
+    f.sourceKva = vm->fKva; f.width = (unsigned)W; f.height = (unsigned)H; f.pitch = (unsigned)P;
     if (gIopAsync && pipe) return nvAccelIopAsyncStart(pipe, fb, head, s, &f);
     const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
     IOReturn rr = sym ? fb->callPlatformFunction(sym, false, &f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
@@ -1936,7 +1937,7 @@ static bool nvAccelFlipTo(IOAccelResource2 *res)
     volatile unsigned char *z = (volatile unsigned char *)&f;
     for (unsigned i = 0; i < sizeof f; i++) z[i] = 0;
     f.version = NVRM_FLIP_ABI_VERSION;
-    f.kapiMemory = vm->fRmHandle; f.allocationCookie = vm->fAllocationCookie;
+    f.kapiMemory = vm->fRmHandle; f.allocationCookie = vm->fAllocationCookie; f.sourceKva = vm->fKva;
     f.width = w; f.height = h; f.pitch = pitch;
 
     const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_FLIP_FN);
