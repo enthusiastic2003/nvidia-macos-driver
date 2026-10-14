@@ -255,6 +255,9 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     NvU32 fRasterW = 0, fRasterH = 0;
     NvU32 fPitchAlign = 256;
     NvU32 fScalerMaxW = 0, fScalerMaxH = 0;
+    // Widest raster offered when it fits the scanout memory. Separate from the scaler limit: a 5120x1440 monitor whose
+    // firmware started at 2560x1440 has a 3840-wide scaler limit, yet 5120x1440 needs less memory than 3840x2160.
+    NvU32 fRasterMaxW = 0;
     NvU64 fAllocSize = 0, fMemBytes = 0;
     unsigned fModeSwitches = 0, fValidateCalls = 0, fValidateOk = 0;
     bool fBootInDT = false;
@@ -348,7 +351,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
 public:
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
-    // 10-11 (studio, 1.14 test, two boots): setting IOFBNeedsRefresh false in open() did not hold - by the time WindowServer
+    // Setting IOFBNeedsRefresh false in open() did not hold - by the time WindowServer
     // read it ("device_preserves_framebuffer: needs_refresh = YES", 0.3 s later) it was Yes again and WindowServer drew
     // the white Apple logo over the NullMoth one. While the boot image is held, every write of Yes is turned into No here,
     // where all of IORegistryEntry's setProperty forms end up.
@@ -366,7 +369,7 @@ public:
     IOReturn open() override;
     const char *getPixelFormats() override { return kPixelFormats; }
     // macOS builds its mode list from getDisplayModes BEFORE it calls setDetailedTimings, and never re-reads it: a
-    // mode added only in setDetailedTimings never reached WindowServer (measured on studio: 36 added, 0 shown). So the
+    // mode added only in setDetailedTimings never reached WindowServer (36 added, 0 shown). So the
     // display's native-raster modes at every refresh rate NVKMS validated are offered from the first query on.
     IOItemCount getDisplayModeCount() override { if (!fNDT) fNDT = addKmsRefreshModes(0); return (fBootInDT ? 0 : 1) + fNDT; }
     IOReturn getDisplayModes(IODisplayModeID *allDisplayModes) override {
@@ -398,6 +401,7 @@ public:
     IOReturn getAttributeForConnection(IOIndex connectIndex, IOSelect attribute, uintptr_t *value) override;
     IOReturn getAppleSense(IOIndex connectIndex, UInt32 *senseType, UInt32 *primary, UInt32 *extended, UInt32 *displayType) override;
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override;
+    bool setHeadPower(bool awake);
     IOReturn setPowerState(unsigned long ordinal, IOService *device) override;
     IOReturn setCursorImage(void *cursorImage) override;
     IOReturn setCursorState(SInt32 x, SInt32 y, bool visible) override;
@@ -590,7 +594,7 @@ OSDefineMetaClassAndStructors(NVRMBootFB, IOFramebuffer)
 
 #define super IOFramebuffer
 
-// The firmware can leave a display lit on a head we do not use (studio: HDMI-0 on head 2, while this driver drives it
+// The firmware can leave a display lit on a head we do not use (seen: HDMI-0 on head 2, while this driver drives it
 // from head 1). A commit that names only our head leaves that head as the firmware set it, and NVKMS then shuts it down
 // inside every one of our modesets ("TAKEOVER head 2 SHUTDOWN ... HDMI-0"): two heads on one connector, and the panel
 // strobed or went black after a refresh change. NVIDIA's own driver commits the state of every head; so does this:
@@ -864,6 +868,8 @@ bool NVRMNVDAFramebuffer::kapiInit()
         if (mw < fW) mw = fW;
         if (mh < fH) mh = fH;
         fScalerMaxW = mw; fScalerMaxH = mh;
+        fRasterMaxW = fW * 2 > 7680 ? 7680 : fW * 2;
+        if (fRasterMaxW < fW) fRasterMaxW = fW;
         const NvU64 mp_ = ((NvU64)mw * 4 + pitchAlign - 1) & ~((NvU64)pitchAlign - 1);
         fAllocSize = (mp_ * mh + 0xffff) & ~0xffffull;
         if (fAllocSize < fSize) fAllocSize = fSize;
@@ -913,7 +919,7 @@ bool NVRMNVDAFramebuffer::kapiInit()
         if (!fMem && mp.size != fSize) {
             FBLOG("%s: allocateMemory(%llu) for scaled modes failed -- falling back to the boot size %llu (no mode above %ux%u)",
                   what, (unsigned long long)mp.size, fSize, fW, fH);
-            fAllocSize = fSize; fScalerMaxW = fW; fScalerMaxH = fH; mp.size = fSize;
+            fAllocSize = fSize; fScalerMaxW = fW; fScalerMaxH = fH; fRasterMaxW = fW; mp.size = fSize;
             fMem = fKms->allocateMemory(fDev, &mp);
         }
         if (!fMem) { FBLOG("%s: allocateMemory(%llu) failed", what, fSize); continue; }
@@ -1057,7 +1063,7 @@ bool NVRMNVDAFramebuffer::kapiInit()
         const OSSymbol *take = OSSymbol::withCString("NVRMBootScreen"), *done = OSSymbol::withCString("NVRMBootScreenDone");
         void *img = NULL; uint32_t dims[3] = { 0, 0, 0 };
         IOReturn r = (rm && take) ? rm->callPlatformFunction(take, false, &img, dims, NULL, NULL) : kIOReturnNotFound;
-        // 10-11 (studio, 1.14 test): the copy read back as one flat value (0xFFFFFFFF everywhere: the console aperture
+        // The copy read back as one flat value (0xFFFFFFFF everywhere: the console aperture
         // answered with all ones), and painting it turned the screen white until the login window. A real boot screen is
         // never one value at the corner, the centre and the quarter points, so such a copy is not painted (black instead).
         bool flat = false;
@@ -1180,7 +1186,7 @@ IOReturn NVRMNVDAFramebuffer::open()
         if (!fLogoWatch) fLogoWatch = thread_call_allocate(logoWatchFire, this);
         if (fLogoWatch && !fLogoWatchN) { uint64_t d; clock_interval_to_deadline(200, kMillisecondScale, &d); scheduleCall(fLogoWatch, d); }
     }
-    // 10-11 (studio, 1.14 test): IOFramebuffer left IOFBNeedsRefresh = Yes after open, WindowServer read it 0.3 s later
+    // IOFramebuffer left IOFBNeedsRefresh = Yes after open, WindowServer read it 0.3 s later
     // ("device_preserves_framebuffer: needs_refresh = YES") and drew its own boot screen - the white Apple logo over the
     // NullMoth one. The screen does hold the boot image, so say so again for WindowServer.
     if (fLogoKeep) {
@@ -1699,7 +1705,7 @@ void NVRMNVDAFramebuffer::vblFire(thread_call_param_t p0, thread_call_param_t)
     NVRMCallReference callReference(me);
     if (OSAddAtomic(0, &me->fStopping)) return;
     if (!me->fVblTimer) return;
-    // 10-07 (studio, two monitors 75 Hz + 60 Hz): head 1 never latched a pure flip, so its hw vblank was never
+    // With two monitors (75 Hz + 60 Hz), head 1 never latched a pure flip, so its hw vblank was never
     // registered and its VBL stayed this free-running timer - not locked to the panel's scan-out, so the second screen
     // jittered while head 0 (real vblank) was smooth. The latch was only a proxy for "this head has a mode": registering
     // with no mode divided by zero in SetupVBlankRgSemaphoreForApiHead (pixelClock 0). A committed modeset on this head
@@ -2067,8 +2073,8 @@ unsigned NVRMNVDAFramebuffer::addKmsRefreshModes(unsigned n)
 {
     if (!fKms || !fDev || !fDisplay) return n;
     const unsigned cap = sizeof fDT / sizeof fDT[0], fromMac = n;
-    // n == 0: nothing from macOS yet - offer the boot raster (the display's own) at every other refresh rate.
-    const NvU32 bootHz = (fBootMode.timings.refreshRate + 500) / 1000;
+    // Publish a desktop timing for the boot raster too; the basic boot mode
+    // alone is not a desktop-capable detailed timing.
     unsigned added = 0;
     for (NvU32 i = 0; i < 256 && n < cap; i++) {
         struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, pref = NV_FALSE;
@@ -2086,14 +2092,13 @@ unsigned NVRMNVDAFramebuffer::addKmsRefreshModes(unsigned n)
             if (d.horizontalActive != k.hVisible || d.verticalActive != k.vVisible) continue;
             if (j < fromMac) raster = true;
             // only an unscaled entry is this refresh rate on the panel; macOS's scaled desktops built on a rate we
-            // offered must not hide that rate's own mode (studio: 1344x756@100 listed, 1920x1080@100 gone)
+            // offered must not hide that rate's own mode (e.g. 1344x756@100 listed, 1920x1080@100 gone)
             if (d.horizontalScaled || d.verticalScaled) continue;
             const UInt64 dt = (UInt64)(d.horizontalActive + d.horizontalBlanking) * (d.verticalActive + d.verticalBlanking);
             const NvU32 dhz = dt ? (NvU32)((d.pixelClock + dt / 2) / dt) : 0;
             if (dhz + 1 >= hz && dhz <= hz + 1) { have = true; break; }
             if (tmpl < 0 && j < fromMac && !d.horizontalScaled && !d.verticalScaled) tmpl = (int)j;
         }
-        if (!fromMac) raster = fBootW && k.hVisible == fBootW && k.vVisible == fBootH && hz != bootHz && hz + 1 != bootHz && hz != bootHz + 1;
         // A raster macOS never proposed is offered too when NVKMS validated it for this display and it fits the scanout
         // memory and the scaler. Without this, rasters that exist only in the EDID's DisplayID extension (most 100-240 Hz
         // modes, issue #29) and every raster above a 1080p firmware raster (a 4K monitor stuck at 1920x1080, issue #49)
@@ -2103,7 +2108,8 @@ unsigned NVRMNVDAFramebuffer::addKmsRefreshModes(unsigned n)
         // until the user logged in blind; with this block removed it showed again on that machine. Smaller desktops still
         // come from macOS's own scaled modes on the native raster.
         const bool larger = fBootW && k.hVisible >= fBootW && k.vVisible >= fBootH && (k.hVisible > fBootW || k.vVisible > fBootH);
-        if (!raster && !have && larger && fMemBytes && k.hVisible <= fScalerMaxW && k.vVisible <= fScalerMaxH) {
+        const bool bootRaster = fBootW && k.hVisible == fBootW && k.vVisible == fBootH;
+        if (!raster && !have && (bootRaster || larger) && fMemBytes && k.hVisible <= fRasterMaxW && k.vVisible <= fScalerMaxH) {
             NvU32 pitch = 0;
             if (nvrmCheckedPitch(k.hVisible, fPitchAlign, &pitch) && (NvU64)pitch * k.vVisible <= fMemBytes) raster = true;
         }
@@ -2538,7 +2544,11 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
 
     const SInt64 budget = (SInt64)nvrmVramBudget(fBarLen);
     gVramBudgetBytes = budget;
-    SInt64 before = OSAddAtomic64((SInt64)want, &gVramMappedBytes) + gVramParkedBytes;
+    // Parked blocks hold VRAM but no BAR1 mapping (unmapped when parked), so they no longer count here. WAS: parked bytes
+    // counted against the budget; 1.14 raised the park ceiling from 24 to 64 MB, and on a 256 MB BAR1 (every GTX 16,
+    // boards without Resizable BAR) surfaces were left as little as 128 MB of the 192 MB budget: GTX 16 reports on
+    // 1.14.x logged 24 to 1062 "BAR1 budget spent" refusals and black screens with a cursor; on 1.13, 0 on five of six.
+    SInt64 before = OSAddAtomic64((SInt64)want, &gVramMappedBytes);
     if (before + (SInt64)want > budget) {
         OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
         FBLOG("nvAllocVram(%llu): REFUSED — BAR1 budget spent (%lld of %llu bytes). "
@@ -2573,8 +2583,10 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
                   !p ? "has no physical address" : onScanout ? "OVERLAPS THE SCANOUT" : "OVERLAPS THE CONSOLE");
             if (gNParkedForever < (int)(sizeof gParkedForever / sizeof gParkedForever[0]) &&
                 gVramParkedBytes + (SInt64)want <= (SInt64)NVRM_VRAM_PARK_CEILING) {
+                // kept allocated so NVKMS cannot place a surface there again, but unmapped: nothing ever reads it
+                fKms->unmapMemory(fDev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, k);
                 gParkedForever[gNParkedForever].m = m;
-                gParkedForever[gNParkedForever].k = k;
+                gParkedForever[gNParkedForever].k = nullptr;
                 gParkedForever[gNParkedForever].n = want;
                 gNParkedForever++;
                 OSAddAtomic64((SInt64)want, &gVramParkedBytes);
@@ -3151,7 +3163,7 @@ IOReturn NVRMNVDAFramebuffer::getAttributeForConnection(IOIndex connectIndex, IO
     case kConnectionControllerDepthsSupported: if (value) *value = 0x00000002; return kIOReturnSuccess;
     case kConnectionColorMode:                 if (value) *value = 0x00000001; return kIOReturnSuccess;
     case kConnectionCheckEnable:               if (value) *value = 1; return kIOReturnSuccess;
-    case kConnectionDisplayFlags:              if (value) *value = 1; return kIOReturnSuccess;
+    case kConnectionDisplayFlags:              if (value) *value = 0; return kIOReturnSuccess;
     case kConnectionSupportsHLDDCSense:
         FBLOG("fb%u getAFC HLDDCSense -> %s (EDID %u B)", fIndex, fEdidSize >= 128 ? "YES" : "no", (unsigned)fEdidSize);
         return fEdidSize >= 128 ? kIOReturnSuccess : kIOReturnUnsupported;
@@ -3181,28 +3193,41 @@ bool NVRMNVDAFramebuffer::headOff()
     hr->modeSetConfig.bActive = NV_FALSE;
     hr->modeSetConfig.numDisplays = 0;
     hr->flags.activeChanged = hr->flags.displaysChanged = NV_TRUE;
-    NvBool ok = fKms->applyModeSetConfig(fDev, cfg, rep, NV_TRUE);
+    NvBool ok = submitConfig(cfg, rep, NV_TRUE);
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
     return ok ? true : false;
+}
+bool NVRMNVDAFramebuffer::setHeadPower(bool awake)
+{
+    NVRMDisplayGate gate; if (!gate.valid()) return false;
+    char nb[8] = { 0 };
+    if (PE_parse_boot_argn("-nvrmnodpms", nb, sizeof nb)) return true;
+    if (OSAddAtomic(0, &fStopping)) return false;
+    if (awake) {
+        if (!fHeadSlept) return true;
+        const bool ok = reflip();
+        // A rejected wake must remain retryable on the next power request.
+        if (ok) fHeadSlept = false;
+        FBLOG("display wake: head %u mode and surface committed again -> %s (rc %d)", fHead, ok ? "ok" : "FAILED", fReflipRc);
+        return ok;
+    }
+    if (!fModeSet || !fSurf || fHeadSlept) return true;
+    const bool ok = headOff();
+    if (ok) fHeadSlept = true;
+    FBLOG("display sleep: head %u off -> %s", fHead, ok ? "ok (monitor goes to standby)" : "FAILED (last frame stays)");
+    return ok;
 }
 IOReturn NVRMNVDAFramebuffer::setPowerState(unsigned long ordinal, IOService *device)
 {
     FBLOG("setPowerState %lu", (unsigned long)ordinal);
-    char nb[8] = { 0 };
-    const bool dpms = !PE_parse_boot_argn("-nvrmnodpms", nb, sizeof nb);
     if (ordinal) {
-        if (dpms && fHeadSlept) {
-            fHeadSlept = false;
-            bool ok = reflip();
-            FBLOG("display wake: head %u mode and surface committed again -> %s (rc %d)", fHead, ok ? "ok" : "FAILED", fReflipRc);
-        }
+        // a failed wake stays retryable (fHeadSlept kept) but WindowServer is still told the display is on, as 1.14.7 did:
+        // without the notification it never redraws, and the head can sit black with nothing left to retry it (review)
+        (void)setHeadPower(true);
         handleEvent(kIOFBNotifyDidPowerOn);
     } else {
         handleEvent(kIOFBNotifyWillPowerOff);
-        if (dpms && fModeSet && fSurf && !fHeadSlept && !OSAddAtomic(0, &fStopping)) {
-            bool ok = headOff(); fHeadSlept = ok;
-            FBLOG("display sleep: head %u off -> %s", fHead, ok ? "ok (monitor goes to standby)" : "FAILED (last frame stays)");
-        }
+        (void)setHeadPower(false);
     }
     return kIOPMAckImplied;
 }
@@ -3231,6 +3256,8 @@ IOReturn NVRMNVDAFramebuffer::setAttribute(IOSelect attribute, uintptr_t value)
 IOReturn NVRMNVDAFramebuffer::setAttributeForConnection(IOIndex connectIndex, IOSelect attribute, uintptr_t value)
 {
     FBSEL(attribute);
+    // Head power follows setPowerState only, the one path that has shipped; a second path here was new on every monitor
+    // with no report asking for it, and its errors were new to callers that always got success (1.15 review).
     if (attribute == kConnectionPower) { FBLOG("setAFC '%s' POWER %lu -> success", _s, (unsigned long)value); return kIOReturnSuccess; }
     switch (attribute) {
     case kConnectionColorModesSupported:
